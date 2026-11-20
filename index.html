@@ -154,10 +154,12 @@
 
         body.immersive #remote-video {
             position: fixed;
-            inset: 0;
+            top: 50%;
+            left: 50%;
             width: 100vw;
             height: 100vh;
             height: 100dvh;
+            transform: translate(-50%, -50%) rotate(var(--rot, 0deg));
             min-height: 0;
             margin: 0;
             border-radius: 0;
@@ -167,6 +169,19 @@
         }
 
         body.immersive.fill #remote-video { object-fit: cover; }
+
+        /* Image tournée de 90° : on inverse largeur et hauteur pour remplir l'écran */
+        body.immersive.rot-side #remote-video {
+            width: 100vh;
+            width: 100dvh;
+            height: 100vw;
+        }
+
+        /* Rotation aussi visible hors plein écran */
+        body:not(.immersive) #remote-video { transform: rotate(var(--rot, 0deg)); }
+
+        body.immersive { cursor: none; }
+        body.immersive.show-ui { cursor: auto; }
 
         #immersive-bar {
             display: none;
@@ -290,10 +305,14 @@
         </p>
 
         <!-- muted + playsinline + autopictureinpicture : indispensables sur iPhone -->
-        <video id="remote-video" autoplay playsinline muted controls autopictureinpicture></video>
+        <video id="remote-video" autoplay playsinline muted controls autopictureinpicture controlslist="nofullscreen"></video>
 
         <button id="fullscreen-btn" class="hidden" style="background:#111">
             ⛶ Plein écran
+        </button>
+
+        <button id="rotate-btn" class="hidden" style="background:#17a2b8">
+            ⟳ Pivoter l'image (téléphone en paysage)
         </button>
 
         <button id="pip-btn" class="hidden" style="background:#6f42c1">
@@ -305,6 +324,8 @@
         </button>
 
         <p class="notice">
+            Si l'image arrive couchée (iPhone en paysage), appuyez sur « Pivoter l'image »
+            ou sur la touche R du clavier. Q pivote dans l'autre sens, F passe en plein écran.<br>
             Tournez le téléphone en paysage : l'écran partagé prend automatiquement tout l'écran.
             Touchez la vidéo pour faire apparaître les boutons « Remplir » et « Quitter ».<br>
             Sur iPhone : avant de quitter Safari, appuyez sur « Mode fenêtre flottante ».
@@ -318,6 +339,8 @@
 
 <!-- Boutons affichés en plein écran -->
 <div id="immersive-bar">
+    <button id="rot-left-btn" title="Pivoter à gauche (touche Q)">⟲ Pivoter</button>
+    <button id="rot-right-btn" title="Pivoter à droite (touche R)">⟳ Pivoter</button>
     <button id="fit-btn">↔ Remplir</button>
     <button id="exit-immersive-btn">✕ Quitter</button>
 </div>
@@ -663,6 +686,7 @@
             requestWakeLock();
             showPipButtonIfSupported();
             $("fullscreen-btn").classList.remove("hidden");
+            $("rotate-btn").classList.remove("hidden");
             if (isLandscape()) enterImmersive(); // déjà en paysage à l'arrivée du flux
 
             const pc = call.peerConnection;
@@ -791,6 +815,7 @@
         $("stop-receive-btn").classList.add("hidden");
         $("pip-btn").classList.add("hidden");
         $("fullscreen-btn").classList.add("hidden");
+        $("rotate-btn").classList.add("hidden");
         exitImmersive();
         setStatus(recvStatus, "Réception arrêtée.");
     }
@@ -838,9 +863,41 @@
     function showBarBriefly() {
         const bar = $("immersive-bar");
         bar.classList.remove("faded");
+        document.body.classList.add("show-ui");
         clearTimeout(barTimer);
-        barTimer = setTimeout(() => bar.classList.add("faded"), 3000);
+        barTimer = setTimeout(() => {
+            bar.classList.add("faded");
+            document.body.classList.remove("show-ui");
+        }, 3000);
     }
+
+    // ---------- Rotation de l'image ----------
+    // L'iPhone envoie toujours un écran en portrait : quand il est tourné
+    // en paysage, l'image arrive couchée. On la redresse ici.
+    let rotation = 0;
+    try { rotation = parseInt(localStorage.getItem("rotation") || "0", 10) || 0; } catch {}
+
+    function applyRotation() {
+        rotation = ((rotation % 360) + 360) % 360;
+        document.body.style.setProperty("--rot", rotation + "deg");
+        document.body.classList.toggle("rot-side", rotation === 90 || rotation === 270);
+        try { localStorage.setItem("rotation", String(rotation)); } catch {}
+    }
+
+    function rotate(delta) {
+        rotation += delta;
+        applyRotation();
+        if (document.body.classList.contains("immersive")) showBarBriefly();
+    }
+
+    applyRotation();
+
+    $("rot-left-btn").addEventListener("click", e => { e.stopPropagation(); rotate(-90); });
+    $("rot-right-btn").addEventListener("click", e => { e.stopPropagation(); rotate(90); });
+    $("rotate-btn").addEventListener("click", () => {
+        rotate(90);
+        goFullscreen();
+    });
 
     // Mode immersif : la vidéo couvre toute la page (marche partout, iPhone compris).
     function enterImmersive() {
@@ -853,31 +910,68 @@
     }
 
     function exitImmersive() {
-        document.body.classList.remove("immersive", "fill");
+        document.body.classList.remove("immersive", "fill", "show-ui");
         remoteVideo.controls = true;
         $("fit-btn").textContent = "↔ Remplir";
+        if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     }
 
-    // Bouton : vrai plein écran du système quand c'est possible.
+    // Plein écran : on met TOUTE la page en plein écran (et pas la balise vidéo seule),
+    // sinon le navigateur ignore la rotation et les boutons.
     async function goFullscreen() {
         if (!remoteVideo.srcObject) return;
-        try {
-            if (document.fullscreenEnabled && remoteVideo.requestFullscreen) {
-                // Android, ordinateur, iPad
-                await remoteVideo.requestFullscreen({ navigationUI: "hide" });
-                try { await screen.orientation.lock("landscape"); } catch {}
-                return;
-            }
-            if (typeof remoteVideo.webkitEnterFullscreen === "function") {
-                // iPhone : lecteur plein écran natif d'iOS
-                remoteVideo.webkitEnterFullscreen();
-                return;
-            }
-        } catch (error) {
-            console.warn("Plein écran natif refusé, passage en mode immersif.", error);
-        }
         enterImmersive();
+
+        const root = document.documentElement;
+        try {
+            if (document.fullscreenEnabled && root.requestFullscreen) {
+                // Ordinateur, Android, iPad
+                await root.requestFullscreen({ navigationUI: "hide" });
+                try { await screen.orientation.lock("landscape"); } catch {}
+            } else if (root.webkitRequestFullscreen) {
+                root.webkitRequestFullscreen();
+            }
+            // iPhone : pas de plein écran de page autorisé par iOS,
+            // le mode immersif (vidéo sur toute la page) prend le relais.
+        } catch (error) {
+            console.warn("Plein écran du navigateur refusé, mode immersif seul.", error);
+        }
     }
+
+    document.addEventListener("fullscreenchange", () => {
+        // Le bouton plein écran intégré à la vidéo ignore la rotation :
+        // on le remplace par notre plein écran.
+        if (document.fullscreenElement === remoteVideo) {
+            document.exitFullscreen().then(goFullscreen).catch(() => {});
+            return;
+        }
+        // Sortie du plein écran avec Échap : on revient à la page normale.
+        if (!document.fullscreenElement && !isLandscape()) exitImmersive();
+    });
+
+    // Double-clic / double-tap sur la vidéo = plein écran.
+    remoteVideo.addEventListener("dblclick", event => {
+        event.preventDefault();
+        if (document.body.classList.contains("immersive")) exitImmersive();
+        else goFullscreen();
+    });
+
+    // Souris qui bouge = afficher les boutons (sur ordinateur).
+    document.addEventListener("mousemove", () => {
+        if (document.body.classList.contains("immersive")) showBarBriefly();
+    });
+
+    // Raccourcis clavier : F = plein écran, R / Q = pivoter, Échap = quitter.
+    document.addEventListener("keydown", event => {
+        if (event.target.tagName === "INPUT" || !remoteVideo.srcObject) return;
+        const k = event.key.toLowerCase();
+        if (k === "r") rotate(90);
+        else if (k === "q") rotate(-90);
+        else if (k === "f") {
+            if (document.body.classList.contains("immersive")) exitImmersive();
+            else goFullscreen();
+        } else if (k === "escape" && document.body.classList.contains("immersive")) exitImmersive();
+    });
 
     $("fullscreen-btn").addEventListener("click", goFullscreen);
 
