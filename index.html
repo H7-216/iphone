@@ -95,6 +95,34 @@
             font-size: 14px;
         }
 
+        .code-box {
+            font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+            font-size: 44px;
+            font-weight: bold;
+            letter-spacing: 6px;
+            color: #007bff;
+            background: #eef5ff;
+            border: 2px solid #007bff;
+            border-radius: 10px;
+            padding: 14px;
+            margin: 10px 0 15px;
+            user-select: all;
+        }
+
+        #peer-id-input {
+            font-size: 26px;
+            text-align: center;
+            letter-spacing: 4px;
+            text-transform: uppercase;
+            font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        }
+
+        #peer-id-input::placeholder {
+            font-size: 15px;
+            letter-spacing: 0;
+            text-transform: none;
+        }
+
         .hidden { display: none !important; }
 
         .status {
@@ -244,6 +272,14 @@
             Préparation du partage...
         </p>
 
+        <div class="input-group">
+            <label for="quality-select"><strong>Type de contenu partagé :</strong></label>
+            <select id="quality-select" style="width:100%;padding:12px;margin-top:8px;border-radius:6px;border:1px solid #ccc;font-size:14px">
+                <option value="motion">🎬 Vidéo / jeu (priorité à la fluidité)</option>
+                <option value="detail">📄 Texte / document (priorité à la netteté)</option>
+            </select>
+        </div>
+
         <button id="start-screen-btn" style="background:#dc3545">
             Démarrer le partage d'écran
         </button>
@@ -253,23 +289,26 @@
                 Votre écran est prêt à être partagé !
             </p>
 
-            <p>Copiez ce lien et envoyez-le à votre correspondant :</p>
-            <div id="generated-link" class="url-box"></div>
-
-            <button id="copy-link-btn" style="background:#218838">
-                📋 Copier le lien de partage
-            </button>
-
-            <p>Ou utilisez la clé de connexion :</p>
-            <div id="generated-key" class="url-box"></div>
-
-            <button id="copy-key-btn">
-                Copier la clé de connexion
-            </button>
+            <p>Tapez ce code sur l'autre appareil :</p>
+            <div id="generated-key" class="code-box"></div>
 
             <button id="open-modal-btn" style="background:#f39c12">
-                🔍 Afficher le QR code
+                🔍 Afficher le QR code (connexion sans rien taper)
             </button>
+
+            <details style="margin-top:12px;text-align:left">
+                <summary style="cursor:pointer;color:#555">Autres options (lien, copier le code)</summary>
+
+                <div id="generated-link" class="url-box"></div>
+
+                <button id="copy-link-btn" style="background:#218838">
+                    📋 Copier le lien de partage
+                </button>
+
+                <button id="copy-key-btn">
+                    Copier le code
+                </button>
+            </details>
 
             <button id="stop-sharing-btn" style="background:#555">
                 Arrêter le partage
@@ -293,8 +332,12 @@
             <input
                 type="text"
                 id="peer-id-input"
-                placeholder="Collez ici le lien ou la clé..."
+                placeholder="Code à 6 caractères (ex. K7P 2QM)"
                 autocomplete="off"
+                autocorrect="off"
+                autocapitalize="characters"
+                spellcheck="false"
+                enterkeyhint="go"
             >
         </div>
 
@@ -381,13 +424,35 @@
         receiverUI.classList.toggle("hidden", mode !== "receiver");
     }
 
-    function createPeer() {
+    // ---------- Code court ----------
+    // Le serveur PeerJS est public : on préfixe le code pour éviter les collisions
+    // avec d'autres sites. L'utilisateur ne voit et ne tape que les 6 caractères.
+    const CODE_PREFIX = "partage-ecran-direct-v1-";
+    const CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // sans 0/O, 1/I/L : pas de confusion
+    const CODE_LENGTH = 6;
+
+    function generateCode() {
+        const bytes = new Uint32Array(CODE_LENGTH);
+        crypto.getRandomValues(bytes);
+        return Array.from(bytes, b => CODE_CHARS[b % CODE_CHARS.length]).join("");
+    }
+
+    function formatCode(code) {
+        return code.slice(0, 3) + " " + code.slice(3);
+    }
+
+    // Majuscules et sans espaces/tirets : "k7p 2qm" -> "K7P2QM".
+    function normalizeCode(text) {
+        return text.toUpperCase().replace(/[\s\-_.]/g, "");
+    }
+
+    function createPeer(id) {
         if (!window.Peer) {
             throw new Error(
                 "La bibliothèque PeerJS n'a pas été chargée. Vérifiez votre connexion Internet."
             );
         }
-        return new Peer();
+        return id ? new Peer(id) : new Peer();
     }
 
     function buildShareLink(peerId) {
@@ -397,15 +462,20 @@
         return url.href;
     }
 
+    // Accepte : le code court, le lien complet, ou une ancienne clé longue.
     function readPeerId(value) {
-        const text = value.trim();
+        let text = value.trim();
         if (!text) return "";
         try {
             const url = new URL(text);
-            return url.searchParams.get("peer") || text;
-        } catch {
-            return text;
+            text = url.searchParams.get("peer") || text;
+        } catch { /* pas un lien */ }
+
+        const code = normalizeCode(text);
+        if (code.length === CODE_LENGTH && /^[A-Z0-9]+$/.test(code)) {
+            return CODE_PREFIX + code;
         }
+        return text; // ancienne clé longue
     }
 
     async function copyText(text, successMessage) {
@@ -468,32 +538,47 @@
 
             setStatus($("sender-status"), "Sélectionnez l'écran ou la fenêtre à partager...");
 
+            // On demande la meilleure définition possible au lieu du réglage par défaut.
             localStream = await navigator.mediaDevices.getDisplayMedia({
-                video: true,
+                video: {
+                    width: { ideal: 2560 },
+                    height: { ideal: 1440 },
+                    frameRate: { ideal: 30, max: 60 }
+                },
                 audio: false
             });
+
+            // "motion" = priorité à la fluidité (vidéo), "detail" = priorité à la netteté (texte).
+            const track = localStream.getVideoTracks()[0];
+            if ("contentHint" in track) track.contentHint = $("quality-select").value;
 
             $("local-video").srcObject = localStream;
             setStatus($("sender-status"), "Création de votre lien de partage...");
 
-            senderPeer = createPeer();
+            // Crée la connexion avec un code court ; en cas de doublon on recommence.
+            const startSenderPeer = (attempt = 0) => {
+            const code = generateCode();
+            const peer = createPeer(CODE_PREFIX + code);
+            senderPeer = peer;
 
-            senderPeer.on("open", id => {
+
+            peer.on("open", () => {
                 // "open" peut revenir après une reconnexion : on ne régénère que la 1re fois.
-                if ($("generated-key").textContent === id) {
+                if ($("generated-key").dataset.code === code) {
                     setStatus($("sender-status"), "Reconnecté au serveur. Partage actif.", "success");
                     return;
                 }
 
-                $("generated-key").textContent = id;
-                $("generated-link").textContent = buildShareLink(id);
+                $("generated-key").dataset.code = code;
+                $("generated-key").textContent = formatCode(code);
+                $("generated-link").textContent = buildShareLink(code);
 
                 sharingTools.classList.remove("hidden");
                 startButton.classList.add("hidden");
 
                 setStatus(
                     $("sender-status"),
-                    "Serveur de connexion prêt. Envoyez le lien au récepteur.",
+                    "Prêt ! Tapez le code sur l'autre appareil.",
                     "success"
                 );
 
@@ -511,10 +596,10 @@
             });
 
             // Le récepteur (ex. iPhone) demande le flux, y compris après une coupure.
-            senderPeer.on("connection", connection => {
+            peer.on("connection", connection => {
                 connection.on("data", data => {
                     if (!data || data.type !== "watch") return;
-                    if (!localStream || !senderPeer || senderPeer.destroyed) return;
+                    if (!localStream || peer.destroyed) return;
 
                     // Ferme l'ancien appel vers ce même récepteur (reconnexion).
                     for (const c of senderCalls) {
@@ -524,7 +609,7 @@
                         }
                     }
 
-                    const call = senderPeer.call(connection.peer, localStream);
+                    const call = peer.call(connection.peer, localStream);
                     if (!call) {
                         setStatus($("sender-status"), "Impossible de lancer l'appel vidéo.", "error");
                         return;
@@ -532,6 +617,7 @@
 
                     senderCalls.add(call);
                     updateViewerCount();
+                    boostQuality(call);
 
                     call.on("close", () => { senderCalls.delete(call); updateViewerCount(); });
                     call.on("error", error => {
@@ -545,22 +631,31 @@
             });
 
             // Coupure avec le serveur PeerJS : on se reconnecte en gardant la même clé.
-            senderPeer.on("disconnected", () => {
-                if (!senderPeer || senderPeer.destroyed) return;
+            peer.on("disconnected", () => {
+                if (peer !== senderPeer || peer.destroyed) return;
                 setStatus($("sender-status"), "Connexion au serveur perdue, reconnexion...");
                 setTimeout(() => {
-                    if (senderPeer && !senderPeer.destroyed && senderPeer.disconnected) {
-                        senderPeer.reconnect();
+                    if (peer === senderPeer && !peer.destroyed && peer.disconnected) {
+                        peer.reconnect();
                     }
                 }, 1000);
             });
 
-            senderPeer.on("error", error => {
+            peer.on("error", error => {
                 console.error("PeerJS :", error);
+                // Code déjà pris par quelqu'un d'autre (très rare) : on en tire un nouveau.
+                if (error.type === "unavailable-id" && attempt < 5) {
+                    peer.destroy();
+                    startSenderPeer(attempt + 1);
+                    return;
+                }
                 // Ces erreurs concernent un seul récepteur : le partage continue.
                 if (error.type === "peer-unavailable") return;
                 setStatus($("sender-status"), "Erreur de connexion : " + error.message, "error");
             });
+            };
+
+            startSenderPeer();
 
             localStream.getVideoTracks()[0].addEventListener("ended", stopSharing);
             requestWakeLock();
@@ -574,6 +669,48 @@
             setStatus($("sender-status"), error.message, "error");
             startButton.disabled = false;
         }
+    });
+
+    // Par défaut, WebRTC limite le débit (souvent vers 2 Mb/s) et baisse la définition
+    // dès que le réseau hésite : c'est ce qui rend l'image floue et pixelisée.
+    // On autorise un débit bien plus haut et on garde la définition.
+    async function applyQuality(call) {
+        const pc = call.peerConnection;
+        if (!pc) return;
+        const mode = $("quality-select").value;
+
+        for (const sender of pc.getSenders()) {
+            if (!sender.track || sender.track.kind !== "video") continue;
+            try {
+                const params = sender.getParameters();
+                if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+                params.encodings[0].maxBitrate = 10_000_000;   // 10 Mb/s
+                params.encodings[0].maxFramerate = 30;
+                params.encodings[0].scaleResolutionDownBy = 1;
+                params.degradationPreference =
+                    mode === "detail" ? "maintain-resolution" : "balanced";
+                await sender.setParameters(params);
+            } catch (error) {
+                console.warn("Réglage qualité non appliqué :", error);
+            }
+        }
+    }
+
+    function boostQuality(call) {
+        const pc = call.peerConnection;
+        if (!pc) return;
+        // Les paramètres ne sont modifiables qu'une fois la connexion négociée.
+        pc.addEventListener("connectionstatechange", () => {
+            if (pc.connectionState === "connected") applyQuality(call);
+        });
+        setTimeout(() => applyQuality(call), 1500);
+    }
+
+    // Changement de mode en cours de partage.
+    $("quality-select").addEventListener("change", () => {
+        const track = localStream?.getVideoTracks()[0];
+        if (track && "contentHint" in track) track.contentHint = $("quality-select").value;
+        senderCalls.forEach(applyQuality);
     });
 
     function updateViewerCount() {
@@ -592,7 +729,7 @@
     });
 
     $("copy-key-btn").addEventListener("click", () => {
-        copyText($("generated-key").textContent, "Clé de connexion copiée !");
+        copyText($("generated-key").dataset.code || "", "Code copié !");
     });
 
     $("open-modal-btn").addEventListener("click", () => { qrModal.style.display = "flex"; });
@@ -615,6 +752,7 @@
         releaseWakeLock();
         $("local-video").srcObject = null;
         $("generated-key").textContent = "";
+        delete $("generated-key").dataset.code;
         sharingTools.classList.add("hidden");
         $("start-screen-btn").classList.remove("hidden");
         $("start-screen-btn").disabled = false;
@@ -635,6 +773,7 @@
     let targetId = "";
     let wantWatching = false;     // l'utilisateur veut regarder : on reconnecte tout seul
     let lastAttempt = 0;
+    let hadStream = false;        // au moins une image reçue depuis la connexion
     let retryTimer = null;
     let watchdog = null;
 
@@ -681,6 +820,7 @@
         call.on("stream", remoteStream => {
             remoteVideo.srcObject = remoteStream;
             remoteVideo.play().catch(() => {});
+            hadStream = true;
             setStatus(recvStatus, "Connecté ! L'écran est en direct.", "success");
             connectBtn.disabled = false;
             requestWakeLock();
@@ -761,7 +901,9 @@
     function scheduleRetry(delay = 2000) {
         if (!wantWatching) return;
         clearTimeout(retryTimer);
-        if (!isStreamAlive()) setStatus(recvStatus, "Reconnexion en cours...");
+        if (!isStreamAlive()) {
+            setStatus(recvStatus, hadStream ? "Reconnexion en cours..." : "Connexion en cours...");
+        }
         retryTimer = setTimeout(() => {
             if (!wantWatching || isStreamAlive()) return;
             ensurePeerAndRequest();
@@ -777,6 +919,7 @@
 
         // Nouvelle clé : on repart de zéro.
         if (id !== targetId) {
+            hadStream = false;
             if (currentCall) currentCall.close();
             currentCall = null;
             if (recvPeer && !recvPeer.destroyed) recvPeer.destroy();
@@ -1005,7 +1148,7 @@
 
     // ---------- Retour sur la page / réseau revenu ----------
     function onBackToPage() {
-        if (!wantWatching) return;
+        if (!wantWatching || !hadStream) return;
         requestWakeLock();
         if (isStreamAlive()) {
             remoteVideo.play().catch(() => {});
@@ -1039,10 +1182,27 @@
     if (incomingPeer || incomingMode === "receiver") {
         showMode("receiver");
         if (incomingPeer) {
-            $("peer-id-input").value = incomingPeer;
-            setStatus(recvStatus, "Lien détecté ! Cliquez sur « Se connecter » pour recevoir l'écran.");
+            // Lien ou QR code ouvert : connexion directe, sans rien toucher.
+            const shown = normalizeCode(incomingPeer);
+            $("peer-id-input").value = shown.length === CODE_LENGTH ? formatCode(shown) : incomingPeer;
+            setStatus(recvStatus, "Lien détecté ! Connexion en cours...");
+            connectToSender();
         }
     }
+
+    // Saisie du code : mise en forme "ABC 123" et connexion dès le 6e caractère.
+    $("peer-id-input").addEventListener("input", event => {
+        const input = event.target;
+        if (/^https?:|\//i.test(input.value)) return; // lien collé : on n'y touche pas
+        const code = normalizeCode(input.value).replace(/[^A-Z0-9]/g, "");
+        if (code.length > CODE_LENGTH) return;        // ancienne clé longue : on laisse
+        input.value = code.length > 3 ? formatCode(code) : code;
+        if (code.length === CODE_LENGTH) connectToSender();
+    });
+
+    $("peer-id-input").addEventListener("keydown", event => {
+        if (event.key === "Enter") connectToSender();
+    });
 })();
 </script>
 </body>
