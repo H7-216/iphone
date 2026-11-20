@@ -275,8 +275,9 @@
         <div class="input-group">
             <label for="quality-select"><strong>Type de contenu partagé :</strong></label>
             <select id="quality-select" style="width:100%;padding:12px;margin-top:8px;border-radius:6px;border:1px solid #ccc;font-size:14px">
-                <option value="motion">🎬 Vidéo / jeu (priorité à la fluidité)</option>
-                <option value="detail">📄 Texte / document (priorité à la netteté)</option>
+                <option value="latency">⚡ Faible latence (recommandé pour le direct)</option>
+                <option value="motion">🎬 Vidéo en haute qualité (un peu plus de retard)</option>
+                <option value="detail">📄 Texte / document (netteté maximale)</option>
             </select>
         </div>
 
@@ -346,6 +347,8 @@
         <p id="connection-status" class="status">
             En attente de connexion...
         </p>
+
+        <p id="net-info" class="notice" style="margin-top:0"></p>
 
         <!-- muted + playsinline + autopictureinpicture : indispensables sur iPhone -->
         <video id="remote-video" autoplay playsinline muted controls autopictureinpicture controlslist="nofullscreen"></video>
@@ -538,19 +541,14 @@
 
             setStatus($("sender-status"), "Sélectionnez l'écran ou la fenêtre à partager...");
 
-            // On demande la meilleure définition possible au lieu du réglage par défaut.
+            // Définition et images/seconde choisies selon le mode sélectionné.
             localStream = await navigator.mediaDevices.getDisplayMedia({
-                video: {
-                    width: { ideal: 2560 },
-                    height: { ideal: 1440 },
-                    frameRate: { ideal: 30, max: 60 }
-                },
+                video: displayConstraints(currentProfile()),
                 audio: false
             });
 
-            // "motion" = priorité à la fluidité (vidéo), "detail" = priorité à la netteté (texte).
             const track = localStream.getVideoTracks()[0];
-            if ("contentHint" in track) track.contentHint = $("quality-select").value;
+            if ("contentHint" in track) track.contentHint = currentProfile().hint;
 
             $("local-video").srcObject = localStream;
             setStatus($("sender-status"), "Création de votre lien de partage...");
@@ -671,24 +669,52 @@
         }
     });
 
-    // Par défaut, WebRTC limite le débit (souvent vers 2 Mb/s) et baisse la définition
-    // dès que le réseau hésite : c'est ce qui rend l'image floue et pixelisée.
-    // On autorise un débit bien plus haut et on garde la définition.
+    // ---------- Profils qualité / latence ----------
+    // Par défaut, WebRTC limite le débit (vers 2 Mb/s) et baisse la définition dès que
+    // le réseau hésite. À l'inverse, un débit trop haut sur un Wi-Fi moyen remplit les
+    // files d'attente du réseau et crée du retard. Chaque profil fait un compromis.
+    const PROFILES = {
+        latency: { hint: "motion", bitrate: 4_000_000,  fps: 30, width: 1920, height: 1080, degradation: "maintain-framerate" },
+        motion:  { hint: "motion", bitrate: 10_000_000, fps: 30, width: 2560, height: 1440, degradation: "balanced" },
+        detail:  { hint: "detail", bitrate: 10_000_000, fps: 15, width: 2560, height: 1440, degradation: "maintain-resolution" }
+    };
+
+    function currentProfile() {
+        return PROFILES[$("quality-select").value] || PROFILES.latency;
+    }
+
+    function displayConstraints(profile) {
+        return {
+            width: { ideal: profile.width, max: profile.width },
+            height: { ideal: profile.height, max: profile.height },
+            frameRate: { ideal: profile.fps, max: profile.fps }
+        };
+    }
+
+    async function applyTrackProfile() {
+        const track = localStream?.getVideoTracks()[0];
+        if (!track) return;
+        const profile = currentProfile();
+        if ("contentHint" in track) track.contentHint = profile.hint;
+        try { await track.applyConstraints(displayConstraints(profile)); } catch {}
+    }
+
     async function applyQuality(call) {
         const pc = call.peerConnection;
         if (!pc) return;
-        const mode = $("quality-select").value;
+        const profile = currentProfile();
 
         for (const sender of pc.getSenders()) {
             if (!sender.track || sender.track.kind !== "video") continue;
             try {
                 const params = sender.getParameters();
                 if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-                params.encodings[0].maxBitrate = 10_000_000;   // 10 Mb/s
-                params.encodings[0].maxFramerate = 30;
+                params.encodings[0].maxBitrate = profile.bitrate;
+                params.encodings[0].maxFramerate = profile.fps;
                 params.encodings[0].scaleResolutionDownBy = 1;
-                params.degradationPreference =
-                    mode === "detail" ? "maintain-resolution" : "balanced";
+                params.encodings[0].priority = "high";
+                params.encodings[0].networkPriority = "high";
+                params.degradationPreference = profile.degradation;
                 await sender.setParameters(params);
             } catch (error) {
                 console.warn("Réglage qualité non appliqué :", error);
@@ -708,8 +734,7 @@
 
     // Changement de mode en cours de partage.
     $("quality-select").addEventListener("change", () => {
-        const track = localStream?.getVideoTracks()[0];
-        if (track && "contentHint" in track) track.contentHint = $("quality-select").value;
+        applyTrackProfile();
         senderCalls.forEach(applyQuality);
     });
 
@@ -811,6 +836,67 @@
         });
     }
 
+    // ---------- Faible latence côté récepteur ----------
+    // Le navigateur garde une réserve d'images (tampon de gigue) pour lisser l'affichage.
+    // Elle peut monter à plusieurs centaines de ms : on lui demande de la réduire au minimum.
+    function enableLowLatency(call) {
+        const pc = call.peerConnection;
+        if (!pc) return;
+        for (const receiver of pc.getReceivers()) {
+            try {
+                if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0; // Chrome, Edge récents
+                if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = 0;     // anciens Chrome
+            } catch {}
+        }
+    }
+
+    // Affiche le retard mesuré et le type de connexion (directe ou via un relais).
+    let statsTimer = null;
+    function startNetStats(call) {
+        clearInterval(statsTimer);
+        const info = $("net-info");
+        statsTimer = setInterval(async () => {
+            const pc = call.peerConnection;
+            if (!pc || currentCall !== call || pc.connectionState === "closed") {
+                clearInterval(statsTimer);
+                info.textContent = "";
+                return;
+            }
+            try {
+                const stats = await pc.getStats();
+                let pair = null, inbound = null;
+                const byId = new Map();
+                stats.forEach(r => {
+                    byId.set(r.id, r);
+                    if (r.type === "candidate-pair" && r.state === "succeeded" && (r.nominated || r.selected)) pair = r;
+                    if (r.type === "inbound-rtp" && r.kind === "video") inbound = r;
+                });
+
+                const parts = [];
+                if (pair && pair.currentRoundTripTime != null) {
+                    parts.push("Réseau : " + Math.round(pair.currentRoundTripTime * 500) + " ms");
+                }
+                if (inbound && inbound.jitterBufferEmittedCount) {
+                    const buf = 1000 * inbound.jitterBufferDelay / inbound.jitterBufferEmittedCount;
+                    parts.push("Tampon : " + Math.round(buf) + " ms");
+                }
+                if (inbound && inbound.framesPerSecond) {
+                    parts.push(Math.round(inbound.framesPerSecond) + " img/s");
+                }
+                if (inbound && inbound.frameWidth) {
+                    parts.push(inbound.frameWidth + "×" + inbound.frameHeight);
+                }
+                const local = pair && byId.get(pair.localCandidateId);
+                if (local) {
+                    parts.push(local.candidateType === "relay"
+                        ? "⚠️ via un serveur relais (plus de retard)"
+                        : (local.candidateType === "host" ? "✅ connexion directe (même réseau)" : "✅ connexion directe"));
+                }
+                info.textContent = parts.join(" · ");
+            } catch { /* stats indisponibles */ }
+        }, 2000);
+    }
+
     function handleCall(call) {
         if (currentCall && currentCall !== call) currentCall.close();
         currentCall = call;
@@ -822,6 +908,8 @@
             remoteVideo.play().catch(() => {});
             hadStream = true;
             setStatus(recvStatus, "Connecté ! L'écran est en direct.", "success");
+            enableLowLatency(call);
+            startNetStats(call);
             connectBtn.disabled = false;
             requestWakeLock();
             showPipButtonIfSupported();
@@ -959,6 +1047,8 @@
         $("pip-btn").classList.add("hidden");
         $("fullscreen-btn").classList.add("hidden");
         $("rotate-btn").classList.add("hidden");
+        clearInterval(statsTimer);
+        $("net-info").textContent = "";
         exitImmersive();
         setStatus(recvStatus, "Réception arrêtée.");
     }
