@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Partage d'écran Direct</title>
 
     <!-- Bibliothèques nécessaires -->
@@ -149,6 +149,49 @@
             margin: 20px auto;
         }
 
+        /* ---------- PLEIN ÉCRAN (mode immersif) ---------- */
+        body.immersive { overflow: hidden; }
+
+        body.immersive #remote-video {
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            height: 100dvh;
+            min-height: 0;
+            margin: 0;
+            border-radius: 0;
+            background: #000;
+            object-fit: contain;
+            z-index: 2000;
+        }
+
+        body.immersive.fill #remote-video { object-fit: cover; }
+
+        #immersive-bar {
+            display: none;
+            position: fixed;
+            top: max(10px, env(safe-area-inset-top));
+            right: max(10px, env(safe-area-inset-right));
+            z-index: 2001;
+            gap: 8px;
+            transition: opacity .3s;
+        }
+
+        body.immersive #immersive-bar { display: flex; }
+        #immersive-bar.faded { opacity: 0; pointer-events: none; }
+
+        #immersive-bar button {
+            width: auto;
+            margin: 0;
+            padding: 8px 12px;
+            font-size: 13px;
+            background: rgba(0,0,0,.6);
+            border: 1px solid rgba(255,255,255,.4);
+        }
+
+        :fullscreen #remote-video, #remote-video:fullscreen { object-fit: contain; }
+
         @media (max-width: 480px) {
             .grid-roles { grid-template-columns: 1fr; }
             .container { padding: 18px; }
@@ -249,6 +292,10 @@
         <!-- muted + playsinline + autopictureinpicture : indispensables sur iPhone -->
         <video id="remote-video" autoplay playsinline muted controls autopictureinpicture></video>
 
+        <button id="fullscreen-btn" class="hidden" style="background:#111">
+            ⛶ Plein écran
+        </button>
+
         <button id="pip-btn" class="hidden" style="background:#6f42c1">
             📺 Mode fenêtre flottante (garder l'écran en quittant Safari)
         </button>
@@ -258,6 +305,8 @@
         </button>
 
         <p class="notice">
+            Tournez le téléphone en paysage : l'écran partagé prend automatiquement tout l'écran.
+            Touchez la vidéo pour faire apparaître les boutons « Remplir » et « Quitter ».<br>
             Sur iPhone : avant de quitter Safari, appuyez sur « Mode fenêtre flottante ».
             L'écran partagé reste visible dans une petite fenêtre par-dessus les autres applis.
             Si la connexion coupe, elle se relance toute seule quand vous revenez sur la page.
@@ -265,6 +314,12 @@
     </section>
 
     <p id="global-notice" class="notice"></p>
+</div>
+
+<!-- Boutons affichés en plein écran -->
+<div id="immersive-bar">
+    <button id="fit-btn">↔ Remplir</button>
+    <button id="exit-immersive-btn">✕ Quitter</button>
 </div>
 
 <!-- QR CODE -->
@@ -607,6 +662,8 @@
             connectBtn.disabled = false;
             requestWakeLock();
             showPipButtonIfSupported();
+            $("fullscreen-btn").classList.remove("hidden");
+            if (isLandscape()) enterImmersive(); // déjà en paysage à l'arrivée du flux
 
             const pc = call.peerConnection;
             if (pc) {
@@ -733,6 +790,8 @@
         connectBtn.disabled = false;
         $("stop-receive-btn").classList.add("hidden");
         $("pip-btn").classList.add("hidden");
+        $("fullscreen-btn").classList.add("hidden");
+        exitImmersive();
         setStatus(recvStatus, "Réception arrêtée.");
     }
 
@@ -766,6 +825,89 @@
             setStatus(recvStatus, "Fenêtre flottante impossible : utilisez le bouton PiP de la vidéo.", "error");
         }
     });
+
+    // ---------- Plein écran ----------
+    const landscapeQuery = window.matchMedia("(orientation: landscape)");
+    const isTouch = matchMedia("(pointer: coarse)").matches || "ontouchstart" in window;
+    let barTimer = null;
+
+    function isLandscape() {
+        return isTouch && landscapeQuery.matches;
+    }
+
+    function showBarBriefly() {
+        const bar = $("immersive-bar");
+        bar.classList.remove("faded");
+        clearTimeout(barTimer);
+        barTimer = setTimeout(() => bar.classList.add("faded"), 3000);
+    }
+
+    // Mode immersif : la vidéo couvre toute la page (marche partout, iPhone compris).
+    function enterImmersive() {
+        if (!remoteVideo.srcObject) return;
+        document.body.classList.add("immersive");
+        remoteVideo.controls = false;
+        window.scrollTo(0, 0);
+        remoteVideo.play().catch(() => {});
+        showBarBriefly();
+    }
+
+    function exitImmersive() {
+        document.body.classList.remove("immersive", "fill");
+        remoteVideo.controls = true;
+        $("fit-btn").textContent = "↔ Remplir";
+    }
+
+    // Bouton : vrai plein écran du système quand c'est possible.
+    async function goFullscreen() {
+        if (!remoteVideo.srcObject) return;
+        try {
+            if (document.fullscreenEnabled && remoteVideo.requestFullscreen) {
+                // Android, ordinateur, iPad
+                await remoteVideo.requestFullscreen({ navigationUI: "hide" });
+                try { await screen.orientation.lock("landscape"); } catch {}
+                return;
+            }
+            if (typeof remoteVideo.webkitEnterFullscreen === "function") {
+                // iPhone : lecteur plein écran natif d'iOS
+                remoteVideo.webkitEnterFullscreen();
+                return;
+            }
+        } catch (error) {
+            console.warn("Plein écran natif refusé, passage en mode immersif.", error);
+        }
+        enterImmersive();
+    }
+
+    $("fullscreen-btn").addEventListener("click", goFullscreen);
+
+    $("fit-btn").addEventListener("click", event => {
+        event.stopPropagation();
+        const fill = document.body.classList.toggle("fill");
+        $("fit-btn").textContent = fill ? "⤢ Ajuster" : "↔ Remplir";
+        showBarBriefly();
+    });
+
+    $("exit-immersive-btn").addEventListener("click", event => {
+        event.stopPropagation();
+        exitImmersive();
+    });
+
+    // Toucher la vidéo en plein écran = afficher les boutons.
+    remoteVideo.addEventListener("click", () => {
+        if (document.body.classList.contains("immersive")) showBarBriefly();
+    });
+
+    // Rotation du téléphone : paysage = plein écran, portrait = retour normal.
+    function onOrientationChange() {
+        if (!wantWatching || !remoteVideo.srcObject) return;
+        if (isLandscape()) enterImmersive();
+        else exitImmersive();
+    }
+
+    if (landscapeQuery.addEventListener) landscapeQuery.addEventListener("change", onOrientationChange);
+    else landscapeQuery.addListener(onOrientationChange); // anciens Safari
+    window.addEventListener("orientationchange", () => setTimeout(onOrientationChange, 300));
 
     // ---------- Retour sur la page / réseau revenu ----------
     function onBackToPage() {
