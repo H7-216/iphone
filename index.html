@@ -1,0 +1,654 @@
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Partage d'écran Direct</title>
+
+    <!-- Bibliothèques nécessaires -->
+    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+    <style>
+        * { box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            text-align: center;
+            padding: 20px;
+            background: #f4f6f8;
+            color: #333;
+            margin: 0;
+        }
+
+        .container {
+            max-width: 650px;
+            margin: 20px auto;
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,.1);
+        }
+
+        h1 { color: #007bff; font-size: 26px; }
+        h2 { font-size: 22px; }
+
+        .grid-roles {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin: 20px 0;
+        }
+
+        .card {
+            border: 2px dashed #ccc;
+            padding: 15px;
+            border-radius: 8px;
+            background: #fafafa;
+        }
+
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 12px 18px;
+            font-size: 15px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            width: 100%;
+            margin-top: 10px;
+        }
+
+        button:hover { filter: brightness(.9); }
+        button:disabled { opacity: .5; cursor: not-allowed; }
+
+        .input-group {
+            margin: 15px 0;
+            text-align: left;
+        }
+
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            font-size: 14px;
+            margin-top: 8px;
+        }
+
+        video {
+            width: 100%;
+            border-radius: 8px;
+            background: #111;
+            margin-top: 15px;
+            min-height: 180px;
+        }
+
+        .url-box {
+            background: #e9ecef;
+            padding: 12px;
+            border-radius: 6px;
+            font-family: monospace;
+            word-break: break-all;
+            margin: 15px 0;
+            font-size: 14px;
+        }
+
+        .hidden { display: none !important; }
+
+        .status {
+            font-weight: bold;
+            margin: 12px 0;
+            color: #d98200;
+            overflow-wrap: anywhere;
+        }
+
+        .success { color: #218838; }
+        .error { color: #dc3545; }
+
+        .notice {
+            font-size: 13px;
+            color: #666;
+            line-height: 1.5;
+            margin-top: 15px;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            inset: 0;
+            background: rgba(0,0,0,.6);
+            justify-content: center;
+            align-items: center;
+            padding: 15px;
+        }
+
+        .modal-content {
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            text-align: center;
+            max-width: 350px;
+            width: 100%;
+            position: relative;
+        }
+
+        .close-modal {
+            position: absolute;
+            right: 15px;
+            top: 8px;
+            font-size: 26px;
+            cursor: pointer;
+        }
+
+        #qrcode {
+            display: flex;
+            justify-content: center;
+            margin: 20px auto;
+        }
+
+        @media (max-width: 480px) {
+            .grid-roles { grid-template-columns: 1fr; }
+            .container { padding: 18px; }
+            h1 { font-size: 22px; }
+        }
+    </style>
+</head>
+
+<body>
+<div class="container">
+    <h1>🖥️ Partage d'écran Direct</h1>
+    <p>Partagez votre écran avec un autre appareil.</p>
+
+    <!-- Choix du mode -->
+    <div id="setup-ui">
+        <div class="grid-roles">
+            <div class="card">
+                <h3>🔴 Émetteur</h3>
+                <p>Diffusez votre écran.</p>
+                <button id="init-sender">Diffuser mon écran</button>
+            </div>
+
+            <div class="card">
+                <h3>🟢 Récepteur</h3>
+                <p>Regardez un écran partagé.</p>
+                <button id="init-receiver">Recevoir un écran</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ÉMETTEUR -->
+    <section id="sender-ui" class="hidden">
+        <h2 style="color:#dc3545">🔴 Mode Émetteur</h2>
+        <p id="sender-status" class="status">
+            Préparation du partage...
+        </p>
+
+        <button id="start-screen-btn" style="background:#dc3545">
+            Démarrer le partage d'écran
+        </button>
+
+        <div id="sharing-tools" class="hidden">
+            <p style="color:#218838;font-weight:bold">
+                Votre écran est prêt à être partagé !
+            </p>
+
+            <p>Copiez ce lien et envoyez-le à votre correspondant :</p>
+            <div id="generated-link" class="url-box"></div>
+
+            <button id="copy-link-btn" style="background:#218838">
+                📋 Copier le lien de partage
+            </button>
+
+            <p>Ou utilisez la clé de connexion :</p>
+            <div id="generated-key" class="url-box"></div>
+
+            <button id="copy-key-btn">
+                Copier la clé de connexion
+            </button>
+
+            <button id="open-modal-btn" style="background:#f39c12">
+                🔍 Afficher le QR code
+            </button>
+
+            <button id="stop-sharing-btn" style="background:#555">
+                Arrêter le partage
+            </button>
+        </div>
+
+        <video id="local-video" autoplay playsinline muted></video>
+        <p class="notice">
+            Gardez cette page ouverte pendant toute la durée du partage.
+        </p>
+    </section>
+
+    <!-- RÉCEPTEUR -->
+    <section id="receiver-ui" class="hidden">
+        <h2 style="color:#218838">🟢 Mode Récepteur</h2>
+
+        <div class="input-group">
+            <label for="peer-id-input">
+                <strong>Lien ou clé de l'émetteur :</strong>
+            </label>
+            <input
+                type="text"
+                id="peer-id-input"
+                placeholder="Collez ici le lien ou la clé..."
+                autocomplete="off"
+            >
+        </div>
+
+        <button id="connect-btn">Se connecter</button>
+
+        <p id="connection-status" class="status">
+            En attente de connexion...
+        </p>
+
+        <video id="remote-video" autoplay playsinline controls></video>
+    </section>
+
+    <p id="global-notice" class="notice"></p>
+</div>
+
+<!-- QR CODE -->
+<div id="qr-modal" class="modal">
+    <div class="modal-content">
+        <span id="close-modal-btn" class="close-modal">&times;</span>
+        <h3>Scanner le QR code</h3>
+        <p>Scannez ce code avec l'appareil qui recevra l'écran.</p>
+        <div id="qrcode"></div>
+        <button id="close-modal-bottom-btn" style="background:#666">
+            Fermer
+        </button>
+    </div>
+</div>
+
+<script>
+(() => {
+    "use strict";
+
+    let peer = null;
+    let localStream = null;
+    let activeCall = null;
+    let isConnecting = false;
+
+    const $ = id => document.getElementById(id);
+
+    const setupUI = $("setup-ui");
+    const senderUI = $("sender-ui");
+    const receiverUI = $("receiver-ui");
+    const sharingTools = $("sharing-tools");
+    const qrModal = $("qr-modal");
+
+    function setStatus(element, message, type = "") {
+        element.textContent = message;
+        element.className = "status " + type;
+    }
+
+    function showMode(mode) {
+        setupUI.classList.add("hidden");
+        senderUI.classList.toggle("hidden", mode !== "sender");
+        receiverUI.classList.toggle("hidden", mode !== "receiver");
+    }
+
+    function createPeer() {
+        if (!window.Peer) {
+            throw new Error(
+                "La bibliothèque PeerJS n'a pas été chargée. Vérifiez votre connexion Internet."
+            );
+        }
+
+        return new Peer();
+    }
+
+    function buildShareLink(peerId) {
+        // Le lien conserve l'adresse de la page actuellement ouverte.
+        const url = new URL(window.location.href);
+
+        url.searchParams.set("mode", "receiver");
+        url.searchParams.set("peer", peerId);
+
+        return url.href;
+    }
+
+    function readPeerId(value) {
+        const text = value.trim();
+
+        if (!text) return "";
+
+        // Accepte une clé seule ou un lien complet.
+        try {
+            const url = new URL(text);
+            return url.searchParams.get("peer") || text;
+        } catch {
+            return text;
+        }
+    }
+
+    async function copyText(text, successMessage) {
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+            } else {
+                const textarea = document.createElement("textarea");
+                textarea.value = text;
+                textarea.style.position = "fixed";
+                textarea.style.opacity = "0";
+                document.body.appendChild(textarea);
+                textarea.select();
+
+                const copied = document.execCommand("copy");
+                textarea.remove();
+
+                if (!copied) throw new Error("Copie non autorisée");
+            }
+
+            alert(successMessage);
+        } catch (error) {
+            alert("La copie automatique a échoué. Sélectionnez et copiez le texte manuellement.");
+        }
+    }
+
+    // INITIALISATION DE L'ÉMETTEUR
+    $("init-sender").addEventListener("click", () => {
+        showMode("sender");
+        setStatus($("sender-status"), "Cliquez pour démarrer le partage.");
+    });
+
+    // DÉMARRER LE PARTAGE
+    $("start-screen-btn").addEventListener("click", async () => {
+        const startButton = $("start-screen-btn");
+        startButton.disabled = true;
+
+        try {
+            if (!navigator.mediaDevices?.getDisplayMedia) {
+                throw new Error(
+                    "Le partage d'écran nécessite un navigateur compatible et une page HTTPS (ou localhost)."
+                );
+            }
+
+            setStatus($("sender-status"), "Sélectionnez l'écran ou la fenêtre à partager...");
+
+            // Le navigateur demande à l'utilisateur quoi partager.
+            localStream = await navigator.mediaDevices.getDisplayMedia({
+                video: true,
+                audio: false
+            });
+
+            $("local-video").srcObject = localStream;
+
+            setStatus($("sender-status"), "Création de votre lien de partage...");
+
+            peer = createPeer();
+
+            peer.on("open", id => {
+                $("generated-key").textContent = id;
+                $("generated-link").textContent = buildShareLink(id);
+
+                sharingTools.classList.remove("hidden");
+                startButton.classList.add("hidden");
+
+                setStatus(
+                    $("sender-status"),
+                    "Serveur de connexion prêt. Envoyez le lien au récepteur.",
+                    "success"
+                );
+
+                // Génération du QR code contenant le lien complet.
+                $("qrcode").innerHTML = "";
+
+                if (window.QRCode) {
+                    new QRCode($("qrcode"), {
+                        text: $("generated-link").textContent,
+                        width: 220,
+                        height: 220,
+                        correctLevel: QRCode.CorrectLevel.M
+                    });
+                } else {
+                    $("qrcode").textContent = "QR code indisponible. Utilisez le lien ci-dessus.";
+                }
+            });
+
+            peer.on("connection", connection => {
+                connection.on("open", () => {
+                    connection.on("data", data => {
+                        if (!data || data.type !== "watch") return;
+
+                        if (!localStream || peer.destroyed) return;
+
+                        // L'émetteur lance l'appel vidéo vers le récepteur.
+                        const call = peer.call(connection.peer, localStream);
+
+                        if (!call) {
+                            setStatus($("sender-status"), "Impossible de lancer l'appel vidéo.", "error");
+                            return;
+                        }
+
+                        activeCall = call;
+
+                        call.on("close", () => {
+                            if (activeCall === call) activeCall = null;
+                        });
+
+                        call.on("error", error => {
+                            console.error("Erreur vidéo :", error);
+                        });
+                    });
+                });
+
+                connection.on("error", error => {
+                    console.error("Erreur de signalisation :", error);
+                });
+            });
+
+            peer.on("error", error => {
+                console.error("PeerJS :", error);
+                setStatus(
+                    $("sender-status"),
+                    "Erreur de connexion : " + error.message,
+                    "error"
+                );
+            });
+
+            // Arrêt manuel depuis les commandes du navigateur.
+            localStream.getVideoTracks()[0].addEventListener("ended", stopSharing);
+
+        } catch (error) {
+            console.error(error);
+
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+
+            setStatus($("sender-status"), error.message, "error");
+            startButton.disabled = false;
+        }
+    });
+
+    // COPIER LE LIEN
+    $("copy-link-btn").addEventListener("click", () => {
+        copyText(
+            $("generated-link").textContent,
+            "Lien de partage copié ! Envoyez-le à votre correspondant."
+        );
+    });
+
+    // COPIER LA CLÉ
+    $("copy-key-btn").addEventListener("click", () => {
+        copyText(
+            $("generated-key").textContent,
+            "Clé de connexion copiée !"
+        );
+    });
+
+    // QR CODE
+    $("open-modal-btn").addEventListener("click", () => {
+        qrModal.style.display = "flex";
+    });
+
+    function closeModal() {
+        qrModal.style.display = "none";
+    }
+
+    $("close-modal-btn").addEventListener("click", closeModal);
+    $("close-modal-bottom-btn").addEventListener("click", closeModal);
+
+    qrModal.addEventListener("click", event => {
+        if (event.target === qrModal) closeModal();
+    });
+
+    // ARRÊTER LE PARTAGE
+    function stopSharing() {
+        if (activeCall) {
+            activeCall.close();
+            activeCall = null;
+        }
+
+        if (localStream) {
+            localStream.getTracks().forEach(track => track.stop());
+            localStream = null;
+        }
+
+        if (peer && !peer.destroyed) {
+            peer.destroy();
+        }
+
+        peer = null;
+        $("local-video").srcObject = null;
+        sharingTools.classList.add("hidden");
+
+        $("start-screen-btn").classList.remove("hidden");
+        $("start-screen-btn").disabled = false;
+
+        setStatus($("sender-status"), "Partage arrêté.");
+    }
+
+    $("stop-sharing-btn").addEventListener("click", stopSharing);
+
+    // INITIALISATION DU RÉCEPTEUR
+    $("init-receiver").addEventListener("click", () => {
+        showMode("receiver");
+        setStatus($("connection-status"), "Collez le lien de l'émetteur.");
+    });
+
+    // CONNEXION AUTOMATIQUE À PARTIR DU LIEN
+    async function connectToSender() {
+        if (isConnecting) return;
+
+        const targetId = readPeerId($("peer-id-input").value);
+        const status = $("connection-status");
+        const button = $("connect-btn");
+
+        if (!targetId) {
+            setStatus(status, "Veuillez coller le lien ou la clé de l'émetteur.", "error");
+            return;
+        }
+
+        if (!window.Peer) {
+            setStatus(status, "PeerJS n'est pas chargé. Vérifiez votre connexion Internet.", "error");
+            return;
+        }
+
+        isConnecting = true;
+        button.disabled = true;
+
+        setStatus(status, "Connexion au serveur de signalisation...");
+
+        try {
+            peer = createPeer();
+
+            peer.on("open", () => {
+                setStatus(status, "Contact de l'émetteur...");
+
+                // Connexion de signalisation : le récepteur demande le flux.
+                const connection = peer.connect(targetId, {
+                    reliable: true
+                });
+
+                connection.on("open", () => {
+                    connection.send({ type: "watch" });
+                    setStatus(status, "Demande envoyée. En attente du flux vidéo...");
+                });
+
+                connection.on("error", error => {
+                    setStatus(status, "Erreur de connexion : " + error.message, "error");
+                    button.disabled = false;
+                    isConnecting = false;
+                });
+            });
+
+            peer.on("call", call => {
+                activeCall = call;
+
+                // Répondre sans transmettre de caméra ou d'écran.
+                call.answer();
+
+                call.on("stream", remoteStream => {
+                    $("remote-video").srcObject = remoteStream;
+                    $("remote-video").play().catch(() => {});
+
+                    setStatus(status, "Connecté ! L'écran est en direct.", "success");
+                    isConnecting = false;
+                    button.disabled = false;
+                });
+
+                call.on("close", () => {
+                    setStatus(status, "Le partage vidéo est terminé.");
+                    $("remote-video").srcObject = null;
+                    isConnecting = false;
+                    button.disabled = false;
+                });
+
+                call.on("error", error => {
+                    setStatus(status, "Erreur vidéo : " + error.message, "error");
+                    isConnecting = false;
+                    button.disabled = false;
+                });
+            });
+
+            peer.on("error", error => {
+                console.error("Erreur PeerJS :", error);
+
+                setStatus(
+                    status,
+                    "Connexion impossible : " + error.message,
+                    "error"
+                );
+
+                isConnecting = false;
+                button.disabled = false;
+            });
+
+        } catch (error) {
+            setStatus(status, error.message, "error");
+            isConnecting = false;
+            button.disabled = false;
+        }
+    }
+
+    $("connect-btn").addEventListener("click", connectToSender);
+
+    // OUVERTURE DIRECTE DU LIEN : mode réception + clé préremplie.
+    const params = new URLSearchParams(window.location.search);
+    const incomingPeer = params.get("peer");
+    const incomingMode = params.get("mode");
+
+    if (incomingPeer || incomingMode === "receiver") {
+        showMode("receiver");
+
+        if (incomingPeer) {
+            $("peer-id-input").value = incomingPeer;
+            setStatus(
+                $("connection-status"),
+                "Lien détecté ! Cliquez sur « Se connecter » pour recevoir l'écran."
+            );
+        }
+    }
+})();
+</script>
+</body>
+</html>
