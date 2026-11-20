@@ -268,6 +268,8 @@
     <!-- ÉMETTEUR -->
     <section id="sender-ui" class="hidden">
         <h2 style="color:#dc3545">🔴 Mode Émetteur</h2>
+        <p id="sender-info" class="notice" style="margin-top:0"></p>
+
         <p id="sender-status" class="status">
             Préparation du partage...
         </p>
@@ -279,6 +281,11 @@
                 <option value="motion">🎬 Vidéo en haute qualité (un peu plus de retard)</option>
                 <option value="detail">📄 Texte / document (netteté maximale)</option>
             </select>
+
+            <label style="display:flex;align-items:center;gap:8px;margin-top:12px;cursor:pointer">
+                <input type="checkbox" id="audio-check" checked style="width:auto;margin:0">
+                <strong>🔊 Partager aussi le son</strong>
+            </label>
         </div>
 
         <button id="start-screen-btn" style="background:#dc3545">
@@ -361,6 +368,10 @@
             ⟳ Pivoter l'image (téléphone en paysage)
         </button>
 
+        <button id="sound-btn" class="hidden" style="background:#e83e8c">
+            🔇 Activer le son
+        </button>
+
         <button id="pip-btn" class="hidden" style="background:#6f42c1">
             📺 Mode fenêtre flottante (garder l'écran en quittant Safari)
         </button>
@@ -385,6 +396,7 @@
 
 <!-- Boutons affichés en plein écran -->
 <div id="immersive-bar">
+    <button id="sound-btn-fs">🔇 Son</button>
     <button id="rot-left-btn" title="Pivoter à gauche (touche Q)">⟲ Pivoter</button>
     <button id="rot-right-btn" title="Pivoter à droite (touche R)">⟳ Pivoter</button>
     <button id="fit-btn">↔ Remplir</button>
@@ -542,10 +554,28 @@
             setStatus($("sender-status"), "Sélectionnez l'écran ou la fenêtre à partager...");
 
             // Définition et images/seconde choisies selon le mode sélectionné.
+            // Son : pas d'annulation d'écho ni de réduction de bruit, qui abîment la musique.
+            const wantAudio = $("audio-check").checked;
             localStream = await navigator.mediaDevices.getDisplayMedia({
                 video: displayConstraints(currentProfile()),
-                audio: false
+                audio: wantAudio ? {
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                    channelCount: 2,
+                    sampleRate: 48000
+                } : false,
+                systemAudio: "include",
+                selfBrowserSurface: "exclude"
             });
+
+            if (wantAudio && !localStream.getAudioTracks().length) {
+                $("sender-info").textContent =
+                    "⚠️ Aucun son capturé. Relancez le partage et cochez « Partager l'audio » " +
+                    "dans la fenêtre du navigateur (sur Mac, seul le son d'un onglet Chrome peut être partagé).";
+            } else {
+                $("sender-info").textContent = "";
+            }
 
             const track = localStream.getVideoTracks()[0];
             if ("contentHint" in track) track.contentHint = currentProfile().hint;
@@ -607,7 +637,7 @@
                         }
                     }
 
-                    const call = peer.call(connection.peer, localStream);
+                    const call = peer.call(connection.peer, localStream, { sdpTransform: hqAudioSdp });
                     if (!call) {
                         setStatus($("sender-status"), "Impossible de lancer l'appel vidéo.", "error");
                         return;
@@ -616,6 +646,7 @@
                     senderCalls.add(call);
                     updateViewerCount();
                     boostQuality(call);
+                    startSenderStats();
 
                     call.on("close", () => { senderCalls.delete(call); updateViewerCount(); });
                     call.on("error", error => {
@@ -674,8 +705,8 @@
     // le réseau hésite. À l'inverse, un débit trop haut sur un Wi-Fi moyen remplit les
     // files d'attente du réseau et crée du retard. Chaque profil fait un compromis.
     const PROFILES = {
-        latency: { hint: "motion", bitrate: 4_000_000,  fps: 30, width: 1920, height: 1080, degradation: "maintain-framerate" },
-        motion:  { hint: "motion", bitrate: 10_000_000, fps: 30, width: 2560, height: 1440, degradation: "balanced" },
+        latency: { hint: "motion", bitrate: 6_000_000,  fps: 30, width: 1920, height: 1080, degradation: "balanced" },
+        motion:  { hint: "motion", bitrate: 12_000_000, fps: 30, width: 2560, height: 1440, degradation: "balanced" },
         detail:  { hint: "detail", bitrate: 10_000_000, fps: 15, width: 2560, height: 1440, degradation: "maintain-resolution" }
     };
 
@@ -705,6 +736,16 @@
         const profile = currentProfile();
 
         for (const sender of pc.getSenders()) {
+            if (sender.track && sender.track.kind === "audio") {
+                try {
+                    const ap = sender.getParameters();
+                    if (!ap.encodings || !ap.encodings.length) ap.encodings = [{}];
+                    ap.encodings[0].maxBitrate = 256_000; // son stéréo de qualité musique
+                    ap.encodings[0].priority = "high";
+                    await sender.setParameters(ap);
+                } catch {}
+                continue;
+            }
             if (!sender.track || sender.track.kind !== "video") continue;
             try {
                 const params = sender.getParameters();
@@ -720,6 +761,53 @@
                 console.warn("Réglage qualité non appliqué :", error);
             }
         }
+    }
+
+    // Opus (le codec audio de WebRTC) est réglé par défaut pour la voix en mono.
+    // On active la stéréo et un débit élevé, valable des deux côtés de l'appel.
+    function hqAudioSdp(sdp) {
+        const m = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
+        if (!m) return sdp;
+        const pt = m[1];
+        const extra = "stereo=1;sprop-stereo=1;maxaveragebitrate=256000;useinbandfec=1;cbr=0";
+        const fmtpRe = new RegExp("a=fmtp:" + pt + " ([^\\r\\n]*)");
+        if (fmtpRe.test(sdp)) {
+            return sdp.replace(fmtpRe, (line, params) => {
+                const kept = params.split(";").filter(p =>
+                    p && !/^(stereo|sprop-stereo|maxaveragebitrate|useinbandfec|cbr)=/.test(p.trim()));
+                return "a=fmtp:" + pt + " " + kept.concat(extra).join(";");
+            });
+        }
+        return sdp.replace(m[0], m[0] + "\r\na=fmtp:" + pt + " " + extra);
+    }
+
+    // Indique à l'émetteur ce qui limite la qualité (réseau ou processeur).
+    let senderStatsTimer = null;
+    function startSenderStats() {
+        clearInterval(senderStatsTimer);
+        senderStatsTimer = setInterval(async () => {
+            if (!localStream) { clearInterval(senderStatsTimer); return; }
+            const call = [...senderCalls][0];
+            if (!call || !call.peerConnection) return;
+            try {
+                const stats = await call.peerConnection.getStats();
+                let out = null, audio = false;
+                stats.forEach(r => {
+                    if (r.type === "outbound-rtp" && r.kind === "video") out = r;
+                    if (r.type === "outbound-rtp" && r.kind === "audio" && r.bytesSent > 0) audio = true;
+                });
+                if (!out) return;
+                const reasons = { bandwidth: "le réseau (Wi-Fi trop lent)", cpu: "le processeur (appareil trop chargé)", other: "autre" };
+                const parts = [];
+                if (out.frameWidth) parts.push("Envoi : " + out.frameWidth + "×" + out.frameHeight);
+                if (out.framesPerSecond) parts.push(Math.round(out.framesPerSecond) + " img/s");
+                if (out.targetBitrate) parts.push((out.targetBitrate / 1e6).toFixed(1) + " Mb/s");
+                parts.push(audio ? "🔊 son envoyé" : "🔇 pas de son");
+                const lim = out.qualityLimitationReason;
+                if (lim && lim !== "none") parts.push("⚠️ qualité limitée par " + (reasons[lim] || lim));
+                $("sender-info").textContent = parts.join(" · ");
+            } catch {}
+        }, 2000);
     }
 
     function boostQuality(call) {
@@ -775,6 +863,8 @@
         senderPeer = null;
 
         releaseWakeLock();
+        clearInterval(senderStatsTimer);
+        $("sender-info").textContent = "";
         $("local-video").srcObject = null;
         $("generated-key").textContent = "";
         delete $("generated-key").dataset.code;
@@ -843,6 +933,7 @@
         const pc = call.peerConnection;
         if (!pc) return;
         for (const receiver of pc.getReceivers()) {
+            if (receiver.track?.kind !== "video") continue;
             try {
                 if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0; // Chrome, Edge récents
                 if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = 0;     // anciens Chrome
@@ -892,21 +983,71 @@
                         ? "⚠️ via un serveur relais (plus de retard)"
                         : (local.candidateType === "host" ? "✅ connexion directe (même réseau)" : "✅ connexion directe"));
                 }
+                if (info.dataset.noAudio) parts.push("🔇 aucun son envoyé par l'émetteur");
                 info.textContent = parts.join(" · ");
             } catch { /* stats indisponibles */ }
         }, 2000);
     }
 
+    // ---------- Son côté récepteur ----------
+    // Les navigateurs (surtout Safari) bloquent le son tant qu'on n'a pas touché la page.
+    // On essaie de l'activer ; sinon on affiche un bouton « Activer le son ».
+    let soundWanted = true;
+
+    function updateSoundButtons() {
+        const hasAudio = !!remoteVideo.srcObject?.getAudioTracks().length;
+        const on = hasAudio && !remoteVideo.muted;
+        $("sound-btn").classList.toggle("hidden", !hasAudio);
+        $("sound-btn").textContent = on ? "🔊 Couper le son" : "🔇 Activer le son";
+        $("sound-btn").style.background = on ? "#555" : "#e83e8c";
+        $("sound-btn-fs").style.display = hasAudio ? "" : "none";
+        $("sound-btn-fs").textContent = on ? "🔊 Son" : "🔇 Son";
+    }
+
+    async function setupSound(stream) {
+        const hasAudio = stream.getAudioTracks().length > 0;
+        if (!hasAudio) {
+            remoteVideo.muted = true;
+            remoteVideo.play().catch(() => {});
+            $("net-info").dataset.noAudio = "1";
+            updateSoundButtons();
+            return;
+        }
+        delete $("net-info").dataset.noAudio;
+        remoteVideo.volume = 1;
+        remoteVideo.muted = !soundWanted;
+        try {
+            await remoteVideo.play();
+        } catch {
+            // Son refusé sans geste : on relance en muet et on montre le bouton.
+            remoteVideo.muted = true;
+            remoteVideo.play().catch(() => {});
+        }
+        updateSoundButtons();
+    }
+
+    async function toggleSound(event) {
+        event?.stopPropagation();
+        remoteVideo.muted = !remoteVideo.muted;
+        soundWanted = !remoteVideo.muted;
+        try { await remoteVideo.play(); } catch {}
+        updateSoundButtons();
+    }
+
+    $("sound-btn").addEventListener("click", toggleSound);
+    $("sound-btn-fs").addEventListener("click", toggleSound);
+    remoteVideo.addEventListener("volumechange", updateSoundButtons);
+
     function handleCall(call) {
         if (currentCall && currentCall !== call) currentCall.close();
         currentCall = call;
 
-        call.answer(); // on ne renvoie ni caméra ni écran
+        call.answer(undefined, { sdpTransform: hqAudioSdp }); // on ne renvoie ni caméra ni écran
 
         call.on("stream", remoteStream => {
             remoteVideo.srcObject = remoteStream;
-            remoteVideo.play().catch(() => {});
             hadStream = true;
+            setupSound(remoteStream);
             setStatus(recvStatus, "Connecté ! L'écran est en direct.", "success");
             enableLowLatency(call);
             startNetStats(call);
@@ -1047,6 +1188,7 @@
         $("pip-btn").classList.add("hidden");
         $("fullscreen-btn").classList.add("hidden");
         $("rotate-btn").classList.add("hidden");
+        $("sound-btn").classList.add("hidden");
         clearInterval(statsTimer);
         $("net-info").textContent = "";
         exitImmersive();
