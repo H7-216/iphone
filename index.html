@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -247,7 +246,22 @@
             En attente de connexion...
         </p>
 
-        <video id="remote-video" autoplay playsinline controls></video>
+        <!-- muted + playsinline + autopictureinpicture : indispensables sur iPhone -->
+        <video id="remote-video" autoplay playsinline muted controls autopictureinpicture></video>
+
+        <button id="pip-btn" class="hidden" style="background:#6f42c1">
+            📺 Mode fenêtre flottante (garder l'écran en quittant Safari)
+        </button>
+
+        <button id="stop-receive-btn" class="hidden" style="background:#555">
+            Arrêter la réception
+        </button>
+
+        <p class="notice">
+            Sur iPhone : avant de quitter Safari, appuyez sur « Mode fenêtre flottante ».
+            L'écran partagé reste visible dans une petite fenêtre par-dessus les autres applis.
+            Si la connexion coupe, elle se relance toute seule quand vous revenez sur la page.
+        </p>
     </section>
 
     <p id="global-notice" class="notice"></p>
@@ -269,11 +283,6 @@
 <script>
 (() => {
     "use strict";
-
-    let peer = null;
-    let localStream = null;
-    let activeCall = null;
-    let isConnecting = false;
 
     const $ = id => document.getElementById(id);
 
@@ -300,26 +309,19 @@
                 "La bibliothèque PeerJS n'a pas été chargée. Vérifiez votre connexion Internet."
             );
         }
-
         return new Peer();
     }
 
     function buildShareLink(peerId) {
-        // Le lien conserve l'adresse de la page actuellement ouverte.
         const url = new URL(window.location.href);
-
         url.searchParams.set("mode", "receiver");
         url.searchParams.set("peer", peerId);
-
         return url.href;
     }
 
     function readPeerId(value) {
         const text = value.trim();
-
         if (!text) return "";
-
-        // Accepte une clé seule ou un lien complet.
         try {
             const url = new URL(text);
             return url.searchParams.get("peer") || text;
@@ -339,26 +341,41 @@
                 textarea.style.opacity = "0";
                 document.body.appendChild(textarea);
                 textarea.select();
-
                 const copied = document.execCommand("copy");
                 textarea.remove();
-
                 if (!copied) throw new Error("Copie non autorisée");
             }
-
             alert(successMessage);
-        } catch (error) {
+        } catch {
             alert("La copie automatique a échoué. Sélectionnez et copiez le texte manuellement.");
         }
     }
 
-    // INITIALISATION DE L'ÉMETTEUR
+    // Empêche l'écran de se mettre en veille (iOS 16.4+, Chrome, Edge...).
+    let wakeLock = null;
+    async function requestWakeLock() {
+        try {
+            if ("wakeLock" in navigator && document.visibilityState === "visible") {
+                wakeLock = await navigator.wakeLock.request("screen");
+            }
+        } catch { /* non supporté ou refusé : pas grave */ }
+    }
+    function releaseWakeLock() {
+        if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+    }
+
+    // =========================================================
+    // ÉMETTEUR
+    // =========================================================
+    let senderPeer = null;
+    let localStream = null;
+    const senderCalls = new Set();
+
     $("init-sender").addEventListener("click", () => {
         showMode("sender");
         setStatus($("sender-status"), "Cliquez pour démarrer le partage.");
     });
 
-    // DÉMARRER LE PARTAGE
     $("start-screen-btn").addEventListener("click", async () => {
         const startButton = $("start-screen-btn");
         startButton.disabled = true;
@@ -366,25 +383,30 @@
         try {
             if (!navigator.mediaDevices?.getDisplayMedia) {
                 throw new Error(
-                    "Le partage d'écran nécessite un navigateur compatible et une page HTTPS (ou localhost)."
+                    "Ce navigateur ne permet pas de partager l'écran (c'est le cas de Safari sur iPhone). " +
+                    "Lancez la diffusion depuis un ordinateur (Chrome, Edge, Firefox, Safari Mac) en HTTPS."
                 );
             }
 
             setStatus($("sender-status"), "Sélectionnez l'écran ou la fenêtre à partager...");
 
-            // Le navigateur demande à l'utilisateur quoi partager.
             localStream = await navigator.mediaDevices.getDisplayMedia({
                 video: true,
                 audio: false
             });
 
             $("local-video").srcObject = localStream;
-
             setStatus($("sender-status"), "Création de votre lien de partage...");
 
-            peer = createPeer();
+            senderPeer = createPeer();
 
-            peer.on("open", id => {
+            senderPeer.on("open", id => {
+                // "open" peut revenir après une reconnexion : on ne régénère que la 1re fois.
+                if ($("generated-key").textContent === id) {
+                    setStatus($("sender-status"), "Reconnecté au serveur. Partage actif.", "success");
+                    return;
+                }
+
                 $("generated-key").textContent = id;
                 $("generated-link").textContent = buildShareLink(id);
 
@@ -397,9 +419,7 @@
                     "success"
                 );
 
-                // Génération du QR code contenant le lien complet.
                 $("qrcode").innerHTML = "";
-
                 if (window.QRCode) {
                     new QRCode($("qrcode"), {
                         text: $("generated-link").textContent,
@@ -412,240 +432,379 @@
                 }
             });
 
-            peer.on("connection", connection => {
-                connection.on("open", () => {
-                    connection.on("data", data => {
-                        if (!data || data.type !== "watch") return;
+            // Le récepteur (ex. iPhone) demande le flux, y compris après une coupure.
+            senderPeer.on("connection", connection => {
+                connection.on("data", data => {
+                    if (!data || data.type !== "watch") return;
+                    if (!localStream || !senderPeer || senderPeer.destroyed) return;
 
-                        if (!localStream || peer.destroyed) return;
-
-                        // L'émetteur lance l'appel vidéo vers le récepteur.
-                        const call = peer.call(connection.peer, localStream);
-
-                        if (!call) {
-                            setStatus($("sender-status"), "Impossible de lancer l'appel vidéo.", "error");
-                            return;
+                    // Ferme l'ancien appel vers ce même récepteur (reconnexion).
+                    for (const c of senderCalls) {
+                        if (c.peer === connection.peer) {
+                            c.close();
+                            senderCalls.delete(c);
                         }
+                    }
 
-                        activeCall = call;
+                    const call = senderPeer.call(connection.peer, localStream);
+                    if (!call) {
+                        setStatus($("sender-status"), "Impossible de lancer l'appel vidéo.", "error");
+                        return;
+                    }
 
-                        call.on("close", () => {
-                            if (activeCall === call) activeCall = null;
-                        });
+                    senderCalls.add(call);
+                    updateViewerCount();
 
-                        call.on("error", error => {
-                            console.error("Erreur vidéo :", error);
-                        });
+                    call.on("close", () => { senderCalls.delete(call); updateViewerCount(); });
+                    call.on("error", error => {
+                        console.error("Erreur vidéo :", error);
+                        senderCalls.delete(call);
+                        updateViewerCount();
                     });
                 });
 
-                connection.on("error", error => {
-                    console.error("Erreur de signalisation :", error);
-                });
+                connection.on("error", error => console.error("Erreur de signalisation :", error));
             });
 
-            peer.on("error", error => {
+            // Coupure avec le serveur PeerJS : on se reconnecte en gardant la même clé.
+            senderPeer.on("disconnected", () => {
+                if (!senderPeer || senderPeer.destroyed) return;
+                setStatus($("sender-status"), "Connexion au serveur perdue, reconnexion...");
+                setTimeout(() => {
+                    if (senderPeer && !senderPeer.destroyed && senderPeer.disconnected) {
+                        senderPeer.reconnect();
+                    }
+                }, 1000);
+            });
+
+            senderPeer.on("error", error => {
                 console.error("PeerJS :", error);
-                setStatus(
-                    $("sender-status"),
-                    "Erreur de connexion : " + error.message,
-                    "error"
-                );
+                // Ces erreurs concernent un seul récepteur : le partage continue.
+                if (error.type === "peer-unavailable") return;
+                setStatus($("sender-status"), "Erreur de connexion : " + error.message, "error");
             });
 
-            // Arrêt manuel depuis les commandes du navigateur.
             localStream.getVideoTracks()[0].addEventListener("ended", stopSharing);
+            requestWakeLock();
 
         } catch (error) {
             console.error(error);
-
             if (localStream) {
                 localStream.getTracks().forEach(track => track.stop());
                 localStream = null;
             }
-
             setStatus($("sender-status"), error.message, "error");
             startButton.disabled = false;
         }
     });
 
-    // COPIER LE LIEN
-    $("copy-link-btn").addEventListener("click", () => {
-        copyText(
-            $("generated-link").textContent,
-            "Lien de partage copié ! Envoyez-le à votre correspondant."
+    function updateViewerCount() {
+        if (!localStream) return;
+        const n = senderCalls.size;
+        setStatus(
+            $("sender-status"),
+            n === 0 ? "Partage actif. En attente d'un récepteur..."
+                    : `Partage actif : ${n} appareil${n > 1 ? "s" : ""} connecté${n > 1 ? "s" : ""}.`,
+            "success"
         );
-    });
-
-    // COPIER LA CLÉ
-    $("copy-key-btn").addEventListener("click", () => {
-        copyText(
-            $("generated-key").textContent,
-            "Clé de connexion copiée !"
-        );
-    });
-
-    // QR CODE
-    $("open-modal-btn").addEventListener("click", () => {
-        qrModal.style.display = "flex";
-    });
-
-    function closeModal() {
-        qrModal.style.display = "none";
     }
 
-    $("close-modal-btn").addEventListener("click", closeModal);
-    $("close-modal-bottom-btn").addEventListener("click", closeModal);
-
-    qrModal.addEventListener("click", event => {
-        if (event.target === qrModal) closeModal();
+    $("copy-link-btn").addEventListener("click", () => {
+        copyText($("generated-link").textContent, "Lien de partage copié ! Envoyez-le à votre correspondant.");
     });
 
-    // ARRÊTER LE PARTAGE
+    $("copy-key-btn").addEventListener("click", () => {
+        copyText($("generated-key").textContent, "Clé de connexion copiée !");
+    });
+
+    $("open-modal-btn").addEventListener("click", () => { qrModal.style.display = "flex"; });
+    function closeModal() { qrModal.style.display = "none"; }
+    $("close-modal-btn").addEventListener("click", closeModal);
+    $("close-modal-bottom-btn").addEventListener("click", closeModal);
+    qrModal.addEventListener("click", event => { if (event.target === qrModal) closeModal(); });
+
     function stopSharing() {
-        if (activeCall) {
-            activeCall.close();
-            activeCall = null;
-        }
+        senderCalls.forEach(c => c.close());
+        senderCalls.clear();
 
         if (localStream) {
             localStream.getTracks().forEach(track => track.stop());
             localStream = null;
         }
+        if (senderPeer && !senderPeer.destroyed) senderPeer.destroy();
+        senderPeer = null;
 
-        if (peer && !peer.destroyed) {
-            peer.destroy();
-        }
-
-        peer = null;
+        releaseWakeLock();
         $("local-video").srcObject = null;
+        $("generated-key").textContent = "";
         sharingTools.classList.add("hidden");
-
         $("start-screen-btn").classList.remove("hidden");
         $("start-screen-btn").disabled = false;
-
         setStatus($("sender-status"), "Partage arrêté.");
     }
 
     $("stop-sharing-btn").addEventListener("click", stopSharing);
 
-    // INITIALISATION DU RÉCEPTEUR
+    // =========================================================
+    // RÉCEPTEUR (iPhone ou autre)
+    // =========================================================
+    const remoteVideo = $("remote-video");
+    const recvStatus = $("connection-status");
+    const connectBtn = $("connect-btn");
+
+    let recvPeer = null;
+    let currentCall = null;
+    let targetId = "";
+    let wantWatching = false;     // l'utilisateur veut regarder : on reconnecte tout seul
+    let lastAttempt = 0;
+    let retryTimer = null;
+    let watchdog = null;
+
     $("init-receiver").addEventListener("click", () => {
         showMode("receiver");
-        setStatus($("connection-status"), "Collez le lien de l'émetteur.");
+        setStatus(recvStatus, "Collez le lien de l'émetteur.");
     });
 
-    // CONNEXION AUTOMATIQUE À PARTIR DU LIEN
-    async function connectToSender() {
-        if (isConnecting) return;
+    function isStreamAlive() {
+        const stream = remoteVideo.srcObject;
+        if (!stream || !currentCall || !currentCall.open) return false;
+        const live = stream.getVideoTracks().some(t => t.readyState === "live");
+        const pc = currentCall.peerConnection;
+        const ice = pc ? pc.iceConnectionState : "new";
+        return live && ice !== "failed" && ice !== "closed" && ice !== "disconnected";
+    }
 
-        const targetId = readPeerId($("peer-id-input").value);
-        const status = $("connection-status");
-        const button = $("connect-btn");
+    // Demande le flux à l'émetteur (première connexion ou reconnexion).
+    function requestStream() {
+        if (!wantWatching || !recvPeer || recvPeer.destroyed || !recvPeer.open) return;
 
-        if (!targetId) {
-            setStatus(status, "Veuillez coller le lien ou la clé de l'émetteur.", "error");
-            return;
+        lastAttempt = Date.now();
+        setStatus(recvStatus, "Contact de l'émetteur...");
+
+        const connection = recvPeer.connect(targetId, { reliable: true });
+
+        connection.on("open", () => {
+            connection.send({ type: "watch" });
+            setStatus(recvStatus, "Demande envoyée. En attente du flux vidéo...");
+        });
+
+        connection.on("error", error => {
+            console.error("Signalisation :", error);
+            scheduleRetry();
+        });
+    }
+
+    function handleCall(call) {
+        if (currentCall && currentCall !== call) currentCall.close();
+        currentCall = call;
+
+        call.answer(); // on ne renvoie ni caméra ni écran
+
+        call.on("stream", remoteStream => {
+            remoteVideo.srcObject = remoteStream;
+            remoteVideo.play().catch(() => {});
+            setStatus(recvStatus, "Connecté ! L'écran est en direct.", "success");
+            connectBtn.disabled = false;
+            requestWakeLock();
+            showPipButtonIfSupported();
+
+            const pc = call.peerConnection;
+            if (pc) {
+                pc.addEventListener("iceconnectionstatechange", () => {
+                    const s = pc.iceConnectionState;
+                    if (s === "failed" || s === "disconnected") scheduleRetry(1500);
+                });
+            }
+        });
+
+        call.on("close", () => {
+            if (currentCall === call) currentCall = null;
+            if (wantWatching) scheduleRetry();
+            else setStatus(recvStatus, "Le partage vidéo est terminé.");
+        });
+
+        call.on("error", error => {
+            console.error("Erreur vidéo :", error);
+            if (currentCall === call) currentCall = null;
+            scheduleRetry();
+        });
+    }
+
+    function ensurePeerAndRequest() {
+        if (!wantWatching) return;
+
+        // Peer existant : on le réutilise (reconnexion au serveur si besoin).
+        if (recvPeer && !recvPeer.destroyed) {
+            if (recvPeer.disconnected) {
+                try { recvPeer.reconnect(); } catch { /* on recrée plus bas si ça échoue */ }
+                return; // "open" relancera requestStream
+            }
+            if (recvPeer.open) { requestStream(); return; }
+            return; // en cours d'ouverture
         }
-
-        if (!window.Peer) {
-            setStatus(status, "PeerJS n'est pas chargé. Vérifiez votre connexion Internet.", "error");
-            return;
-        }
-
-        isConnecting = true;
-        button.disabled = true;
-
-        setStatus(status, "Connexion au serveur de signalisation...");
 
         try {
-            peer = createPeer();
-
-            peer.on("open", () => {
-                setStatus(status, "Contact de l'émetteur...");
-
-                // Connexion de signalisation : le récepteur demande le flux.
-                const connection = peer.connect(targetId, {
-                    reliable: true
-                });
-
-                connection.on("open", () => {
-                    connection.send({ type: "watch" });
-                    setStatus(status, "Demande envoyée. En attente du flux vidéo...");
-                });
-
-                connection.on("error", error => {
-                    setStatus(status, "Erreur de connexion : " + error.message, "error");
-                    button.disabled = false;
-                    isConnecting = false;
-                });
-            });
-
-            peer.on("call", call => {
-                activeCall = call;
-
-                // Répondre sans transmettre de caméra ou d'écran.
-                call.answer();
-
-                call.on("stream", remoteStream => {
-                    $("remote-video").srcObject = remoteStream;
-                    $("remote-video").play().catch(() => {});
-
-                    setStatus(status, "Connecté ! L'écran est en direct.", "success");
-                    isConnecting = false;
-                    button.disabled = false;
-                });
-
-                call.on("close", () => {
-                    setStatus(status, "Le partage vidéo est terminé.");
-                    $("remote-video").srcObject = null;
-                    isConnecting = false;
-                    button.disabled = false;
-                });
-
-                call.on("error", error => {
-                    setStatus(status, "Erreur vidéo : " + error.message, "error");
-                    isConnecting = false;
-                    button.disabled = false;
-                });
-            });
-
-            peer.on("error", error => {
-                console.error("Erreur PeerJS :", error);
-
-                setStatus(
-                    status,
-                    "Connexion impossible : " + error.message,
-                    "error"
-                );
-
-                isConnecting = false;
-                button.disabled = false;
-            });
-
+            recvPeer = createPeer();
         } catch (error) {
-            setStatus(status, error.message, "error");
-            isConnecting = false;
-            button.disabled = false;
+            setStatus(recvStatus, error.message, "error");
+            return;
+        }
+
+        lastAttempt = Date.now();
+        setStatus(recvStatus, "Connexion au serveur de signalisation...");
+
+        recvPeer.on("open", () => requestStream());
+        recvPeer.on("call", handleCall);
+
+        recvPeer.on("disconnected", () => {
+            // Arrive souvent quand Safari passe en arrière-plan.
+            if (wantWatching) scheduleRetry(1000);
+        });
+
+        recvPeer.on("error", error => {
+            console.error("Erreur PeerJS :", error);
+            if (error.type === "peer-unavailable") {
+                setStatus(recvStatus, "Émetteur introuvable pour l'instant. Nouvel essai...", "error");
+            } else {
+                setStatus(recvStatus, "Connexion perdue : " + error.message + ". Nouvel essai...", "error");
+            }
+            // Peer cassé : on le jette pour en recréer un propre.
+            if (["network", "server-error", "socket-error", "socket-closed", "unavailable-id"].includes(error.type)) {
+                try { recvPeer.destroy(); } catch {}
+                recvPeer = null;
+            }
+            scheduleRetry(3000);
+        });
+    }
+
+    function scheduleRetry(delay = 2000) {
+        if (!wantWatching) return;
+        clearTimeout(retryTimer);
+        if (!isStreamAlive()) setStatus(recvStatus, "Reconnexion en cours...");
+        retryTimer = setTimeout(() => {
+            if (!wantWatching || isStreamAlive()) return;
+            ensurePeerAndRequest();
+        }, delay);
+    }
+
+    function connectToSender() {
+        const id = readPeerId($("peer-id-input").value);
+        if (!id) {
+            setStatus(recvStatus, "Veuillez coller le lien ou la clé de l'émetteur.", "error");
+            return;
+        }
+
+        // Nouvelle clé : on repart de zéro.
+        if (id !== targetId) {
+            if (currentCall) currentCall.close();
+            currentCall = null;
+            if (recvPeer && !recvPeer.destroyed) recvPeer.destroy();
+            recvPeer = null;
+        }
+
+        targetId = id;
+        wantWatching = true;
+        connectBtn.disabled = true;
+        $("stop-receive-btn").classList.remove("hidden");
+
+        // La vidéo est muette : iOS autorise la lecture sans geste supplémentaire.
+        remoteVideo.play().catch(() => {});
+
+        ensurePeerAndRequest();
+
+        // Surveillance : si le flux meurt (veille, changement d'appli, réseau), on relance.
+        clearInterval(watchdog);
+        watchdog = setInterval(() => {
+            if (!wantWatching || document.visibilityState !== "visible") return;
+            if (!isStreamAlive() && Date.now() - lastAttempt > 8000) ensurePeerAndRequest();
+        }, 4000);
+    }
+
+    function stopReceiving() {
+        wantWatching = false;
+        clearTimeout(retryTimer);
+        clearInterval(watchdog);
+        if (currentCall) currentCall.close();
+        currentCall = null;
+        if (recvPeer && !recvPeer.destroyed) recvPeer.destroy();
+        recvPeer = null;
+        remoteVideo.srcObject = null;
+        releaseWakeLock();
+        connectBtn.disabled = false;
+        $("stop-receive-btn").classList.add("hidden");
+        $("pip-btn").classList.add("hidden");
+        setStatus(recvStatus, "Réception arrêtée.");
+    }
+
+    connectBtn.addEventListener("click", connectToSender);
+    $("stop-receive-btn").addEventListener("click", stopReceiving);
+
+    // ---------- Fenêtre flottante (Picture-in-Picture) ----------
+    function pipSupported() {
+        return (document.pictureInPictureEnabled && remoteVideo.requestPictureInPicture) ||
+               (typeof remoteVideo.webkitSupportsPresentationMode === "function" &&
+                remoteVideo.webkitSupportsPresentationMode("picture-in-picture"));
+    }
+
+    function showPipButtonIfSupported() {
+        if (pipSupported()) $("pip-btn").classList.remove("hidden");
+    }
+
+    $("pip-btn").addEventListener("click", async () => {
+        try {
+            await remoteVideo.play().catch(() => {});
+            if (document.pictureInPictureEnabled && remoteVideo.requestPictureInPicture) {
+                if (document.pictureInPictureElement) await document.exitPictureInPicture();
+                else await remoteVideo.requestPictureInPicture();
+            } else if (typeof remoteVideo.webkitSetPresentationMode === "function") {
+                const mode = remoteVideo.webkitPresentationMode === "picture-in-picture"
+                    ? "inline" : "picture-in-picture";
+                remoteVideo.webkitSetPresentationMode(mode);
+            }
+        } catch (error) {
+            console.error(error);
+            setStatus(recvStatus, "Fenêtre flottante impossible : utilisez le bouton PiP de la vidéo.", "error");
+        }
+    });
+
+    // ---------- Retour sur la page / réseau revenu ----------
+    function onBackToPage() {
+        if (!wantWatching) return;
+        requestWakeLock();
+        if (isStreamAlive()) {
+            remoteVideo.play().catch(() => {});
+        } else {
+            scheduleRetry(300);
         }
     }
 
-    $("connect-btn").addEventListener("click", connectToSender);
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+            onBackToPage();
+            if (localStream) requestWakeLock(); // émetteur
+        }
+    });
+    window.addEventListener("pageshow", onBackToPage);   // retour depuis le cache de Safari
+    window.addEventListener("focus", onBackToPage);
+    window.addEventListener("online", () => scheduleRetry(500));
 
-    // OUVERTURE DIRECTE DU LIEN : mode réception + clé préremplie.
+    // Safari met parfois la vidéo en pause en arrière-plan : on relance la lecture.
+    remoteVideo.addEventListener("pause", () => {
+        if (wantWatching && remoteVideo.srcObject) {
+            setTimeout(() => remoteVideo.play().catch(() => {}), 200);
+        }
+    });
+
+    // ---------- Ouverture directe du lien ----------
     const params = new URLSearchParams(window.location.search);
     const incomingPeer = params.get("peer");
     const incomingMode = params.get("mode");
 
     if (incomingPeer || incomingMode === "receiver") {
         showMode("receiver");
-
         if (incomingPeer) {
             $("peer-id-input").value = incomingPeer;
-            setStatus(
-                $("connection-status"),
-                "Lien détecté ! Cliquez sur « Se connecter » pour recevoir l'écran."
-            );
+            setStatus(recvStatus, "Lien détecté ! Cliquez sur « Se connecter » pour recevoir l'écran.");
         }
     }
 })();
